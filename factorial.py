@@ -1,6 +1,6 @@
-a=5
-b=1
-for i in range(1,a+1):
-    b=b*i
-print(b)
-
+with open("notes.txt") as f:
+    data = f.read()
+    print(data)
+data += "\nBharat"
+with open("notes.txt", 'w') as f:
+    f.write(data)
