@@ -6,4 +6,4 @@ for i in range(len(a)):
     for j in range(c-1,-1,-1):
         d.append(a[i][j])
     b.append(d)
-print(b)
+print(b) 
