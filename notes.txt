@@ -1,6 +1,6 @@
 #create a new file(u)
 #git add filename(a)
-#git commite -m "created"
+#git commit -m "created"
 #git status
 #git push orgin main
 
