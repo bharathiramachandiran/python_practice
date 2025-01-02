@@ -1,0 +1,563 @@
+AWSTemplateFormatVersion : '2010-09-09'
+Description: >
+  CodePipeline CFN Stack for 'romex'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: "dev"
+  MainGitBranch:
+    Type: String
+    Default: "development"
+  SourceCodeProvider:
+    Type: String
+    Default: ""
+  BackendRepoName:
+    Description: GitHub repo name
+    Type: String
+    Default: ''
+  Template:
+    Type: String
+    Default: "devops/template.yml"
+  Region:
+    Type: String
+    Default: ""
+  StackName:
+    Type: String
+    Default: ""
+  PipelineArtifactBucket:
+    Type: String
+    Default: ""
+  Tags:
+    Type: String
+    Default: ""
+  ResourcePrefix:
+    Type: String
+    Default: ""
+  DatabaseName:
+    Type: String
+    Default: ""
+  DatabaseUsername:
+    Type: String
+    Default: ""
+  DatabasePassword:
+    Type: String
+    Default: ""
+  HostEndpoint:
+    Type: String
+    Default: ""
+  SchemaName:
+    Type: String
+    Default: ""
+  CodeStarConnectionArn:
+    Type: String
+    Default: ""
+
+Resources:
+  #   ____
+  # / ___|  ___  _   _ _ __ ___ ___
+  # \___ \ / _ \| | | | '__/ __/ _ \
+  #   ___) | (_) | |_| | | | (_|  __/
+  # |____/ \___/ \__,_|_|  \___\___|
+  #  ____  _            _ _
+  # |  _ \(_)_ __   ___| (_)_ __   ___
+  # | |_) | | '_ \ / _ | | | '_ \ / _ \
+  # |  __/| | |_) |  __| | | | | |  __/
+  # |_|   |_| .__/ \___|_|_|_| |_|\___|
+  #         |_|
+
+  
+  MyECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ResourcePrefix}-data-scrapping-${Environment}-ecr
+      
+  DatabaseCredentialsSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${Environment}/${ResourcePrefix}/db-credentials'
+      SecretString:
+        !Sub |
+          {
+            "dbname": "${DatabaseName}",
+            "user": "${DatabaseUsername}",
+            "password": "${DatabasePassword}",
+            "host": "${HostEndpoint}",
+            "schema": "${SchemaName}"
+          }
+
+  CPCBS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PipelineArtifactBucket
+  
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${Environment}-${ResourcePrefix}-backend-pipeline'
+      ArtifactStore:
+        Location: !Sub ${PipelineArtifactBucket}
+        Type: S3
+      RoleArn: !GetAtt CodePipelineExecutionRole.Arn
+      RestartExecutionOnUpdate: true
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceCodeRepo
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: !Ref SourceCodeProvider
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Ref BackendRepoName
+                BranchName: !Ref MainGitBranch
+              OutputArtifacts:
+                - Name: SourceCodeAsZip
+              RunOrder: 1
+        - Name: DevOpsUtilsBuild
+          Actions:              
+            - Name: DevOpsUtilsBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 1
+              Configuration:
+                ProjectName: !Ref DevOpsUtilsCodeBuild
+                PrimarySource: SourceCodeAsZip
+                EnvironmentVariables: !Sub |
+                  [ 
+                    {"name": "ENVIRONMENT", "value": "${Environment}"},
+                    {"name": "AWS_DEFAULT_REGION", "value": "${Region}"},
+                    {"name": "AWS_ACCOUNT_ID", "value": "${AWS::AccountId}"}
+                  ]
+              InputArtifacts:
+                - Name: SourceCodeAsZip
+              OutputArtifacts:
+                - Name: EnvOverrideAsZip 
+        - Name: PackageAndDeploy
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectPackageAndDeploy
+                EnvironmentVariables: !Sub |
+                  [ 
+                    {"name": "AWS_DEFAULT_REGION", "value": "${Region}"},
+                    {"name": "AWS_ACCOUNT_ID", "value": "${AWS::AccountId}"}
+                  ]
+              InputArtifacts:
+                - Name: EnvOverrideAsZip
+
+  PipelineArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PipelineArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Effect: "Deny"
+            Action: "s3:*"
+            Principal: "*"
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowedtoRole
+            Effect: Allow
+            Principal:
+              AWS:
+              - !GetAtt CodePipelineExecutionRole.Arn
+            Action:
+              - s3:*
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*"
+
+  CodePipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-${ResourcePrefix}-CodePipelineExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource: "*"
+        - PolicyName: CodePipelineCodeAndS3Bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Effect: Allow
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*"
+              - Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                Effect: Allow
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*"
+        
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "cloudwatch:PutMetricData"
+                  - "cloudwatch:GetMetricData"
+                  - "cloudwatch:GetMetricStatistics"
+                  - "cloudwatch:ListMetrics"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:UpdateStack"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:GetTemplate"
+                  - "cloudformation:ValidateTemplate"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "iam:PassRole"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "apigateway:GET"
+                  - "apigateway:POST"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: "codestar-connections:UseConnection"
+                Resource: !Ref CodeStarConnectionArn
+
+        - PolicyName: CodePipelineCodeBuildAndCloudformationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "codebuild:StartBuild"
+                  - "codebuild:BatchGetBuilds"
+                Resource:
+                  # Uncomment the line below to enable the unit-tests
+                  - !GetAtt DevOpsUtilsCodeBuild.Arn
+                  - !GetAtt CodeBuildProjectPackageAndDeploy.Arn
+              - Effect: Allow
+                Action:
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:UpdateStack"
+                  - "cloudformation:CreateChangeSet"
+                  - "cloudformation:ExecuteChangeSet"
+                  - "cloudformation:DeleteChangeSet"
+                  - "cloudformation:DescribeChangeSet"
+                  - "cloudformation:SetStackPolicy"
+                  - "cloudformation:SetStackPolicy"
+                  - "cloudformation:ValidateTemplate"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+
+  PipelineStackCloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-${ResourcePrefix}-CloudFormationExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Action: "sts:AssumeRole"
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+      Policies:
+        - PolicyName: GrantCloudFormationFullAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+
+  #   ____          _      ____        _ _     _
+  #  / ___|___   __| | ___| __ ) _   _(_| | __| |
+  # | |   / _ \ / _` |/ _ |  _ \| | | | | |/ _` |
+  # | |__| (_) | (_| |  __| |_) | |_| | | | (_| |
+  #  \____\___/ \__,_|\___|____/ \__,_|_|_|\__,_|
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-${ResourcePrefix}-CodeBuildServiceRole
+      Tags:
+        - Key: Role
+          Value: aws-sam-pipeline-codebuild-service-role-meyiwebsite
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: CodeBuildLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+        - PolicyName: CodeBuildArtifactsBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*"
+        - PolicyName: CodeBuildAccessRoles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:GetBucketLocation"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineArtifactBucket}/*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "codecommit:GitPull"
+                Resource:
+                  - !Sub "arn:aws:codecommit:*:${AWS::AccountId}:*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "codestar-connections:UseConnection"
+                Resource: 
+                  - !Sub "arn:aws:codestar-connections:*:${AWS::AccountId}:connection/*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:InitiateLayerUpload"
+                  - "ecr:UploadLayerPart"
+                  - "ecr:CompleteLayerUpload"
+                  - "ecr:PutImage"
+                Resource: "*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource: 
+                  - !Sub "arn:aws:secretsmanager:*:${AWS::AccountId}:secret:*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "cloudwatch:PutMetricData"
+                Resource: "*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "events:PutEvents"
+                Resource:
+                  - !Sub "arn:aws:events:*:${AWS::AccountId}:event-bus/default"
+              
+              - Effect: "Allow"
+                Action:
+                  - "cognito-idp:DescribeUserPool"
+                  - "cognito-idp:AdminCreateUser"
+                  - "cognito-idp:AdminUpdateUserAttributes"
+                  - "cognito-idp:AdminDeleteUser"
+                Resource: 
+                  - !Sub "arn:aws:cognito-idp:*:${AWS::AccountId}:userpool/*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "cloudformation:*"
+                Resource: "*"
+              
+              - Effect: "Allow"
+                Action:
+                  - "rds:DescribeDBInstances"
+                  - "rds:DescribeDBClusters"
+                Resource: 
+                  - !Sub "arn:aws:rds:*:${AWS::AccountId}:db:*"
+              - Effect: 'Allow'
+                Action:
+                  - 'iam:GetRole'
+                Resource: 
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'lambda:*'
+                Resource: '*'
+              - Effect: "Allow"
+                Action:
+                  - "cloudfront:GetDistribution"
+                  - "cloudfront:CreateInvalidation"
+                Resource: 
+                  - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+        - PolicyName: CloudFrontAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "cloudfront:CreateCloudFrontOriginAccessIdentity"
+                Resource:
+                  - "*"
+  DevOpsUtilsCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: SAM_TEMPLATE
+            Value: !Ref Template
+          - Name: REGION
+            Value: !Ref Region
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref PipelineArtifactBucket
+          - Name: TAGS
+            Value: !Ref Tags
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STAGE
+            Value: !Ref Environment
+          - Name: PREFIX
+            Value: !Ref ResourcePrefix
+          - Name: SECRET_ARN
+            Value: !Ref DatabaseCredentialsSecret
+
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: devops/buildSpec.yml
+      Name: !Sub "${Environment}-${ResourcePrefix}-DevOpsUtils"
+      Description: !Sub 'BuildAndOverride Project for Repo - ${BackendRepoName}'
+  DevOpsUtilsCodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${DevOpsUtilsCodeBuild}"
+      RetentionInDays: 30  
+  CodeBuildProjectPackageAndDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: SAM_TEMPLATE
+            Value: !Ref Template
+          - Name: REGION
+            Value: !Ref Region
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref PipelineArtifactBucket
+          - Name: TAGS
+            Value: !Ref Tags
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STAGE
+            Value: !Ref Environment
+          - Name: PREFIX
+            Value: !Ref ResourcePrefix
+          - Name: SECRET_ARN
+            Value: !Ref DatabaseCredentialsSecret
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: devops/buildDeploy.yml
+      Name: !Sub "${Environment}-${ResourcePrefix}-BuildAndPackage"
+      Description: !Sub 'BuildAndPackage Project for Repo - ${BackendRepoName}'
+  CodeBuildProjectPackageAndDeployLogGroup:
+     Type: AWS::Logs::LogGroup
+     Properties:
+      LogGroupName: !Sub "/aws/codebuild/${CodeBuildProjectPackageAndDeploy}"
+      RetentionInDays: 30
+
+Outputs:
+  CodeBuildServiceRoleArn: 
+    Value: !GetAtt CodeBuildServiceRole.Arn
+  PipelineExecutionRoleArn: 
+    Value: !GetAtt CodePipelineExecutionRole.Arn
+  PipelineStackCloudFormationExecutionRoleArn: 
+    Value: !GetAtt PipelineStackCloudFormationExecutionRole.Arn
+  
+
+     
